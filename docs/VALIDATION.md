@@ -11,6 +11,7 @@
 | `uv run pytest -q` | 23 通过；含 Streamlit AppTest 导入、聊天与范围清空 |
 | `uv run python evals/run.py` | 12/12 通过，使用真实本地 BGE、Chroma 和 DeepSeek |
 | 浏览器交互 | 验证演示资料导入、问答结果、引用展开 |
+| 干净副本复现 | 从 Git 归档创建无 `.env`、无模型及无参考项目的副本，重新安装后静态检查与 23 项离线测试通过 |
 
 最新真实验收：DeepSeek `deepseek-flash`，13 次 API 调用，12025 个服务商报告的总 token，约 18.3 秒。该耗时包含模型加载和检索，受网络、设备、模型服务及缓存影响，不是性能基准或成本承诺。完整输出见 [evaluation.json](evaluation.json)。
 
