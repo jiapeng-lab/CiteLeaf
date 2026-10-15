@@ -6,6 +6,10 @@ from dataclasses import replace
 
 import httpx
 import pytest
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from openai import APIConnectionError, AuthenticationError
 from pypdf import PdfWriter
 
 from citeleaf.agent import DocumentAgent, bounded_history
@@ -15,11 +19,17 @@ from citeleaf.generation import ChatModel, CitationError, ModelError, Source, va
 from citeleaf.knowledge import Knowledge
 
 
-class TinyEncoder:
+class TinyEncoder(Embeddings):
     """Test double only; production always uses a semantic BGE model."""
 
     def encode(self, texts, *, query=False):
         return [[1 + text.count("年假"), 1 + text.count("报销"), 1.0] for text in texts]
+
+    def embed_documents(self, texts):
+        return self.encode(texts)
+
+    def embed_query(self, text):
+        return self.encode([text], query=True)[0]
 
 
 class ScriptedModel:
@@ -189,11 +199,18 @@ def test_summary_reads_tail_and_cache_invalidates_after_delete(kb):
     assert agent.run("总结全文", [ident]).status == "empty"
 
 
-def test_model_errors_redact_credentials(monkeypatch):
+def test_model_errors_redact_credentials():
     settings = Settings(api_key="TEST-SECRET")
-    monkeypatch.setattr(httpx, "post", lambda *a, **kw: httpx.Response(401, text="TEST-SECRET"))
+
+    def unauthorized(value, **kwargs):
+        raise AuthenticationError(
+            "TEST-SECRET",
+            response=httpx.Response(401, request=httpx.Request("POST", "https://example.org")),
+            body={"error": "TEST-SECRET"},
+        )
+
     with pytest.raises(ModelError) as caught:
-        ChatModel(settings).json("system", {})
+        ChatModel(settings, RunnableLambda(unauthorized)).json("system", {})
     assert "TEST-SECRET" not in str(caught.value)
     assert "TEST-SECRET" not in repr(settings)
     with pytest.raises(ModelError, match="设置"):
@@ -222,19 +239,89 @@ def test_streamlit_import_chat_and_scope_reset(tmp_path, monkeypatch):
     assert app.chat_input[0].disabled
 
 
-def test_provider_payload_and_truncated_output(monkeypatch):
-    requests = []
+def test_provider_selection_and_truncated_output():
+    from langchain_deepseek import ChatDeepSeek
+    from langchain_openai import ChatOpenAI
 
-    def respond(*args, **kwargs):
-        requests.append(kwargs["json"])
-        return httpx.Response(
-            200, json={"choices": [{"finish_reason": "length"}], "usage": {"total_tokens": 2400}}
+    model = ChatModel(Settings(api_key="test"))
+    provider = model._build_model()
+    assert isinstance(provider, ChatDeepSeek)
+    assert provider.extra_body == {"thinking": {"type": "disabled"}}
+    other = ChatModel(Settings(api_key="test", base_url="https://example.org/v1"))._build_model()
+    assert isinstance(other, ChatOpenAI) and not isinstance(other, ChatDeepSeek)
+    assert other.extra_body == {}
+    truncated = RunnableLambda(
+        lambda value, **kwargs: AIMessage(
+            content='{"supported":',
+            response_metadata={"finish_reason": "length"},
+            usage_metadata={"input_tokens": 100, "output_tokens": 2400, "total_tokens": 2500},
         )
-
-    monkeypatch.setattr(httpx, "post", respond)
+    )
+    model = ChatModel(Settings(api_key="test"), truncated)
     with pytest.raises(ModelError, match="长度上限"):
-        ChatModel(Settings(api_key="test")).json("system", {})
-    assert requests[-1]["thinking"] == {"type": "disabled"}
-    with pytest.raises(ModelError):
-        ChatModel(Settings(api_key="test", base_url="https://example.org/v1")).json("system", {})
-    assert "thinking" not in requests[-1]
+        model.json("system", {})
+    assert model.calls == 1 and model.tokens == 2500
+
+
+def test_langchain_prompt_parser_and_tracing_boundary():
+    import json
+
+    from langsmith import get_tracing_context
+
+    def respond(prompt, **kwargs):
+        messages = prompt.to_messages()
+        assert messages[0].content == '规则包含JSON花括号：{"a":1}'
+        assert json.loads(messages[1].content) == {"question": "年假有几天？"}
+        assert kwargs["response_format"] == {"type": "json_object"}
+        assert get_tracing_context()["enabled"] is False
+        return AIMessage(content='{"supported":false,"claims":[]}')
+
+    model = ChatModel(Settings(api_key="test"), RunnableLambda(respond))
+    assert model.json('规则包含JSON花括号：{"a":1}', {"question": "年假有几天？"}) == {
+        "supported": False,
+        "claims": [],
+    }
+
+
+def test_partial_json_is_not_repaired_into_success():
+    model = ChatModel(
+        Settings(api_key="test"),
+        RunnableLambda(lambda value, **kwargs: AIMessage(content='{"supported":false')),
+    )
+    with pytest.raises(ModelError, match="完整 JSON"):
+        model.json("system", {})
+
+
+def test_network_retry_is_bounded(monkeypatch):
+    monkeypatch.setattr("citeleaf.generation.time.sleep", lambda delay: None)
+
+    def disconnected(value, **kwargs):
+        raise APIConnectionError(request=httpx.Request("POST", "https://example.org"))
+
+    model = ChatModel(Settings(api_key="test"), RunnableLambda(disconnected))
+    with pytest.raises(ModelError, match="网络"):
+        model.json("system", {})
+    assert model.calls == 2
+
+
+def test_existing_raw_chroma_index_is_readable_after_migration(tmp_path):
+    import chromadb
+    from langchain_chroma import Chroma
+
+    directory = tmp_path / "legacy"
+    client = chromadb.PersistentClient(path=str(directory))
+    fingerprint = hashlib.sha256(b"test-double:420:60:v1").hexdigest()[:12]
+    collection = client.get_or_create_collection(
+        f"citeleaf_{fingerprint}", embedding_function=None, metadata={"hnsw:space": "cosine"}
+    )
+    chunk = parse_file("员工年假需要提前五个工作日申请。".encode(), "legacy.txt")[0]
+    collection.add(
+        ids=[chunk.id],
+        documents=[chunk.text],
+        metadatas=[chunk.metadata()],
+        embeddings=TinyEncoder().embed_documents([chunk.text]),
+    )
+    kb = Knowledge(directory, TinyEncoder(), "test-double")
+    assert isinstance(kb.vectorstore, Chroma)
+    assert kb.search("年假申请", [chunk.doc_id]) == [chunk]
+    assert not kb.ingest("员工年假需要提前五个工作日申请。".encode(), "legacy.txt")[1]

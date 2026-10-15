@@ -2,9 +2,10 @@
 
 import hashlib
 import io
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 MAX_BYTES = 15 * 1024 * 1024
 
@@ -26,20 +27,13 @@ def split_text(text: str, size: int = 420, overlap: int = 60) -> list[str]:
     if not 0 <= overlap < size:
         raise ValueError("分块参数需要满足 0 ≤ overlap < size")
     text = text.replace("\x00", "").replace("\r\n", "\n").strip()
-    pieces, start = [], 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        if end < len(text):
-            boundaries = list(re.finditer(r"\n|[。！？；.!?]", text[start:end]))
-            if boundaries and boundaries[-1].end() > size // 2:
-                end = start + boundaries[-1].end()
-        piece = text[start:end].strip()
-        if piece:
-            pieces.append(piece)
-        if end == len(text):
-            break
-        start = max(start + 1, end - overlap)
-    return pieces
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", " ", ""],
+        keep_separator="end",
+    )
+    return splitter.split_text(text)
 
 
 def parse_file(content: bytes, filename: str) -> list[Chunk]:

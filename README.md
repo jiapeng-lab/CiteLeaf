@@ -6,6 +6,8 @@
 
 一个面向中文 PDF / TXT 的文档问答 Agent：上传资料，在所选文档内提问、继续追问，或生成全文及指定主题摘要。每条结论携带引用和经过逐字校验的原文摘录，文档没有依据时明确说明。
 
+**技术栈：Python + LangChain + RAG**，搭配 Chroma 向量库、BGE 中文 Embedding、DeepSeek 和 Streamlit。
+
 <img src="docs/demo.png" alt="知页 CiteLeaf 文档问答：回答、引用编号与对应原文同屏展示" width="1100" />
 
 “Cite”表示引用，“Leaf”表示书页。项目聚焦文档证据，采用 6 个业务模块的单体架构，便于理解、复现与扩展。
@@ -60,17 +62,17 @@ EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 flowchart TD
     U[问题 + 所选文档 + 最近对话] --> P[有界任务规划]
     P -->|问答| H[必要时改写追问]
-    H --> R[范围内语义检索]
+    H --> R[LangChain Chroma Retriever 范围内检索]
     P -->|摘要| F[按顺序读取全部片段]
     F --> M[分批摘要与层次合并]
-    R --> G[基于证据生成结构化结论]
+    R --> G[LCEL 提示词与模型生成链]
     M --> V[结论引用与原文摘录校验]
     G --> V
     V --> A[回答 + 来源 + 执行步骤]
 ```
 
 - **规划**：显式模式优先，自动模式用有限规则识别摘要请求，决定调用检索工具或全文读取工具。它是有界任务型 Agent，不宣称具备开放式自主规划或 Function Calling。
-- **工具**：`Knowledge.search` 检索选中文档；`Knowledge.read` 顺序读取选中文档；解析、入库和删除是界面可调用的数据能力。
+- **工具**：`Knowledge.search` 调用 LangChain Chroma Retriever 检索选中文档；`Knowledge.read` 顺序读取选中文档；解析、入库和删除是界面可调用的数据能力。
 - **记忆**：保留最近 6 条消息，每条最多 800 字符，仅用于追问理解；历史不作为事实证据。当前问题独立保留，最多 3000 字。
 - **回答**：模型返回 `supported` 和逐条 `claims`，每条结论必须携带证据编号与至少 6 个字符的连续原文摘录。
 - **校验**：编号必须存在，摘录移除空白后必须是对应原文的子串；任一结论失败则停止展示生成答案。
@@ -83,12 +85,20 @@ flowchart TD
 | 组件 | 选择 | 理由 |
 |---|---|---|
 | 界面 | Streamlit | 上传、聊天、引用与下载集中在一个入口 |
-| 向量模型 | BGE small 中文 | CPU 可运行，Embedding 在本地完成 |
-| 向量库 | Chroma 持久化 | 直接保存文本、向量与来源元数据，支持文档范围过滤 |
+| 框架 | LangChain 模块化集成包 | 使用统一 Document、Embeddings、Retriever 和 Runnable 接口 |
+| 向量模型 | HuggingFaceEmbeddings + BGE small 中文 | CPU 可运行，Embedding 在本地完成 |
+| 向量库 | langchain-chroma + Chroma 持久化 | 保存文本、向量与来源元数据，Retriever 按文档范围过滤 |
 | 文档处理 | pypdf + UTF-8 TXT | 覆盖题目格式，PDF 按页保留来源 |
-| 分块 | 标点优先，420 字符 / 60 重叠 | 易解释、可测试；参数需要按实际语料调优 |
-| 模型调用 | httpx + JSON 输出 | 显式控制超时、有限重试与错误信息，减少框架依赖 |
-| 编排 | 小型 Python 控制器 | 核心路径可以直接阅读，扩展工具前先验证证据链 |
+| 分块 | RecursiveCharacterTextSplitter | 420 字符上限，目标重叠 60；优先段落和中文标点 |
+| 模型调用 | ChatDeepSeek；兼容端点用 ChatOpenAI | 统一模型接口，保留超时、有限重试与错误脱敏 |
+| 生成链 | ChatPromptTemplate → 模型 → 严格 JSON 检查 → JsonOutputParser | 用 LCEL 组合提示词、模型和解析器，再校验引用 |
+| 任务控制 | Python 有界控制器 + LangChain RAG 组件 | 显式管理问答、记忆、全文摘要和证据边界 |
+
+RAG（检索增强生成）的问答路径是：上传文档 → LangChain 递归分块 → 本地 Embedding → Chroma 入库 → Retriever 检索 → 将原文证据放进提示词 → 模型生成 → 引用校验。全文摘要使用顺序读取和分批合并，保留与检索问答不同的数据获取方式。
+
+LangChain 通过官方模块化包安装：`langchain-core`、`langchain-text-splitters`、`langchain-huggingface`、`langchain-chroma`、`langchain-deepseek` 和 `langchain-openai`。这些组件参与实际执行，没有额外引入未使用的 Agent 框架。参考 [Chroma 集成](https://docs.langchain.com/oss/python/integrations/vectorstores/chroma)、[DeepSeek 集成](https://docs.langchain.com/oss/python/integrations/chat/deepseek) 和 [递归分块器](https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter) 官方文档。
+
+升级保留原有向量模型、归一化方式、查询前缀、集合名及来源元数据，旧索引仍能读取；新上传文件使用 LangChain 分块器。离线回归专门验证原生 Chroma 索引经 LangChain 读取后的兼容性。
 
 问答不把余弦分数当作“答案正确概率”，由模型判断是否有直接证据。当前 top-6 可能漏掉相关片段，后续可增加混合检索和重排。全文摘要以完整覆盖输入为目标，仍可能在压缩时遗漏信息。
 
@@ -102,6 +112,7 @@ flowchart TD
 - 无历史的普通问题通常一次生成调用；追问增加一次改写；摘要按批处理并保留最多 8 项会话缓存。
 - DeepSeek 官方端点显式关闭默认思考模式，避免简单文档任务的推理消耗挤占 JSON 输出预算；其他服务不发送该专用参数。
 - 向量模型进程内缓存；摘要缓存键包含任务和完整片段内容，避免文档变化后复用。
+- 检索和生成链显式关闭 LangSmith 云端追踪；安装 LangChain 不需要新增追踪服务密钥。
 
 ## 测试与验收
 
@@ -128,9 +139,9 @@ GitHub Actions 运行离线测试和静态检查，不需要密钥，也不调�
 app.py                    # 上传、聊天、引用与导出
 src/citeleaf/
   config.py               # 配置和凭据边界
-  documents.py            # 解析与分块
-  knowledge.py            # BGE、Chroma、检索和范围读取
-  generation.py           # 模型调用、逐条结论与摘录校验
+  documents.py            # 解析与 LangChain 递归分块
+  knowledge.py            # HuggingFaceEmbeddings、Chroma Retriever、范围读取
+  generation.py           # LCEL 生成链、逐条结论与摘录校验
   agent.py                # 规划、记忆和摘要缓存
 tests/test_core.py        # 离线回归
 evals/run.py              # 真实模型验收

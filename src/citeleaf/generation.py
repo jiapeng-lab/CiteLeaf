@@ -6,7 +6,14 @@ import time
 from dataclasses import asdict, dataclass
 from urllib.parse import urlparse
 
-import httpx
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
+from openai import APIConnectionError, APIStatusError
 
 from .config import Settings
 from .documents import Chunk
@@ -21,60 +28,76 @@ class CitationError(ValueError):
 
 
 class ChatModel:
-    def __init__(self, settings: Settings):
+    """LangChain prompt → provider model → strict JSON guard → JSON parser."""
+
+    def __init__(self, settings: Settings, llm=None):
         self.settings = settings
         self.calls = 0
         self.tokens = 0
+        self.llm = llm
+        self.chain = None
+
+    def _build_model(self):
+        deepseek = urlparse(self.settings.base_url).hostname == "api.deepseek.com"
+        provider = ChatDeepSeek if deepseek else ChatOpenAI
+        return provider(
+            model=self.settings.model,
+            api_key=self.settings.api_key,
+            base_url=self.settings.base_url,
+            temperature=0,
+            max_tokens=2400,
+            timeout=60,
+            max_retries=0,  # Retry here so the usage report counts actual attempts.
+            extra_body={"thinking": {"type": "disabled"}} if deepseek else {},
+        )
+
+    def _guard_response(self, message: AIMessage):
+        self.tokens += (message.usage_metadata or {}).get("total_tokens", 0)
+        if message.response_metadata.get("finish_reason") == "length":
+            raise ModelError("模型输出达到长度上限，请缩小文档范围后重试")
+        if not isinstance(message.content, str):
+            raise TypeError("Expected text JSON")
+        # JsonOutputParser can repair partial JSON. Reject incomplete JSON first.
+        if not isinstance(json.loads(message.content), dict):
+            raise TypeError("Expected object")
+        return message
 
     def json(self, system: str, payload: dict) -> dict:
         if not self.settings.api_key:
             raise ModelError("请先在 .env 设置 LLM_API_KEY 或 DEEPSEEK_API_KEY")
+        if self.chain is None:
+            self.llm = self.llm or self._build_model()
+            prompt = ChatPromptTemplate.from_messages(
+                [("system", "{system}"), ("human", "{payload}")]
+            )
+            self.chain = (
+                prompt
+                | self.llm.bind(response_format={"type": "json_object"})
+                | RunnableLambda(self._guard_response)
+                | JsonOutputParser()
+            )
         for attempt in range(2):
             try:
                 self.calls += 1
-                response = httpx.post(
-                    self.settings.base_url + "/chat/completions",
-                    headers={"Authorization": f"Bearer {self.settings.api_key}"},
-                    json={
-                        "model": self.settings.model,
-                        "temperature": 0,
-                        "max_tokens": 2400,
-                        "response_format": {"type": "json_object"},
-                        **(
-                            {"thinking": {"type": "disabled"}}
-                            if urlparse(self.settings.base_url).hostname == "api.deepseek.com"
-                            else {}
-                        ),
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                        ],
-                    },
-                    timeout=httpx.Timeout(60, connect=10),
-                )
-                if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                # Keep document content out of optional cloud tracing services.
+                with tracing_context(enabled=False):
+                    return self.chain.invoke(
+                        {"system": system, "payload": json.dumps(payload, ensure_ascii=False)}
+                    )
+            except APIStatusError as exc:
+                if exc.status_code in {429, 500, 502, 503, 504} and attempt == 0:
                     time.sleep(1)
                     continue
-                if response.status_code != 200:
-                    raise ModelError(
-                        f"模型服务返回 HTTP {response.status_code}，请检查配置或稍后重试"
-                    )
-                body = response.json()
-                self.tokens += body.get("usage", {}).get("total_tokens", 0)
-                message = body["choices"][0]
-                if message.get("finish_reason") == "length":
-                    raise ModelError("模型输出达到长度上限，请缩小文档范围后重试")
-                result = json.loads(message["message"]["content"])
-                if not isinstance(result, dict):
-                    raise TypeError("Expected object")
-                return result
-            except httpx.TransportError as exc:
+                raise ModelError(
+                    f"模型服务返回 HTTP {exc.status_code}，请检查配置或稍后重试"
+                ) from None
+            except APIConnectionError:
                 if attempt == 0:
                     time.sleep(1)
                     continue
-                raise ModelError("模型请求超时或网络不可用，请稍后重试") from exc
-            except (ValueError, KeyError, IndexError, TypeError) as exc:
-                raise ModelError("模型未返回完整 JSON，请重试") from exc
+                raise ModelError("模型请求超时或网络不可用，请稍后重试") from None
+            except (ValueError, KeyError, IndexError, TypeError):
+                raise ModelError("模型未返回完整 JSON，请重试") from None
         raise ModelError("模型请求失败")
 
 

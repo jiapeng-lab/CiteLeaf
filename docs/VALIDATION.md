@@ -2,18 +2,20 @@
 
 日期：2026-10-15（Asia/Shanghai）。环境：macOS Apple Silicon、Python 3.12.14、独立 `.venv`；参考项目不作为运行时依赖。
 
+当前版本：**0.2.0，Python + LangChain + RAG**。问答使用 LangChain Chroma Retriever 和 LCEL 生成链，Embedding 使用 HuggingFaceEmbeddings，分块使用 RecursiveCharacterTextSplitter。
+
 ## 结果
 
 | 检查 | 结果 |
 |---|---|
 | `uv sync --locked --group dev` | 安装并校验项目锁定依赖 |
 | `uv run ruff check .` | 通过 |
-| `uv run pytest -q` | 23 通过；含 Streamlit AppTest 导入、聊天与范围清空 |
+| `uv run pytest -q` | 27 通过；含 Streamlit AppTest、旧索引兼容、LangChain 提示词/解析器、有限重试和截断拦截 |
 | `uv run python evals/run.py` | 12/12 通过，使用真实本地 BGE、Chroma 和 DeepSeek |
 | 浏览器交互 | 验证演示资料导入、问答结果、引用展开 |
-| 干净副本复现 | 从 Git 归档创建无 `.env`、无模型及无参考项目的副本，重新安装后静态检查与 23 项离线测试通过 |
+| 干净副本复现 | 从 Git 归档及当前迁移补丁创建无 `.env`、无模型及无参考项目的副本，重新安装后静态检查与 27 项离线测试通过 |
 
-最新真实验收：DeepSeek `deepseek-flash`，13 次 API 调用，12025 个服务商报告的总 token，约 18.3 秒。该耗时包含模型加载和检索，受网络、设备、模型服务及缓存影响，不是性能基准或成本承诺。完整输出见 [evaluation.json](evaluation.json)。
+最新真实验收：DeepSeek `deepseek-flash`，13 次 API 调用，11687 个服务商报告的总 token，约 17.3 秒。该耗时包含模型加载和检索，受网络、设备、模型服务及缓存影响，不是性能基准或成本承诺。完整输出见 [evaluation.json](evaluation.json)。
 
 ## 人工抽查
 
@@ -31,6 +33,8 @@
 
 第二轮真实验收的长文摘要曾触发输出长度上限。查阅 DeepSeek 当前接口规则后，对官方端点显式关闭默认思考模式；补充请求参数及截断输出回归测试，再运行完整真实验收通过。验收脚本会记录模型错误，并在新运行开始时清除旧报告，避免旧成功结果被误认为本次结果。
 
+LangChain 迁移保留原有文档元数据、BGE 模型和索引集合。回归测试先用原生 Chroma 写入旧格式数据，再通过 LangChain Retriever 读取、验证引用位置与去重行为。JSON 解析器之前增加严格完整性检查，避免解析器修复不完整输出后误报成功；模型 SDK 内部重试关闭，由应用最多重试一次并计数。检索和生成显式关闭 LangSmith 追踪，原文不会因框架迁移而发送给额外追踪服务。
+
 ## 验证范围
 
-本机完整验证 macOS；Linux / Windows 尚未在真实机器验收。仓库配置 GitHub Actions 离线测试，远端运行结果以 Actions 页面为准。未配置公开多人服务、OCR 或鉴权。
+本机完整验证 macOS；Linux 由 GitHub Actions 运行离线测试，远端结果以 Actions 页面为准；Windows 尚未实机验收。未配置公开多人服务、OCR 或鉴权。

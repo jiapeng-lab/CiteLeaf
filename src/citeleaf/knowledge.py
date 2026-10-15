@@ -4,21 +4,33 @@ import hashlib
 from pathlib import Path
 from threading import RLock
 
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langsmith import tracing_context
+
 from .documents import Chunk, parse_file
 
 
-class BGEEncoder:
+class BGEEncoder(Embeddings):
     def __init__(self, model: str):
-        from sentence_transformers import SentenceTransformer
+        from langchain_huggingface import HuggingFaceEmbeddings
 
-        self.model = SentenceTransformer(model, device="cpu")
+        self.model = HuggingFaceEmbeddings(
+            model_name=model,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+            query_encode_kwargs={
+                "normalize_embeddings": True,
+                "prompt": "为这个句子生成表示以用于检索相关文章：",
+            },
+        )
 
-    def encode(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
-        if query:
-            texts = ["为这个句子生成表示以用于检索相关文章：" + text for text in texts]
-        return self.model.encode(
-            texts, normalize_embeddings=True, show_progress_bar=False, batch_size=32
-        ).tolist()
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.model.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.model.embed_query(text)
 
 
 class Knowledge:
@@ -27,12 +39,17 @@ class Knowledge:
 
         self.encoder, self.lock = encoder, RLock()
         self.client = chromadb.PersistentClient(path=str(directory))
-        # Different vector models/chunking versions must never share an index.
+        # Keep the persisted v1 schema/model namespace: existing vectors and sources
+        # remain valid. The LangChain splitter uses the same 420/60 size limits.
         fingerprint = hashlib.sha256((model_id + ":420:60:v1").encode()).hexdigest()[:12]
-        self.collection = self.client.get_or_create_collection(
-            name=f"citeleaf_{fingerprint}",
-            embedding_function=None,
-            metadata={"hnsw:space": "cosine"},
+        self.vectorstore = Chroma(
+            client=self.client,
+            collection_name=f"citeleaf_{fingerprint}",
+            embedding_function=encoder,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+        self.collection = self.client.get_collection(
+            f"citeleaf_{fingerprint}", embedding_function=None
         )
 
     @staticmethod
@@ -45,15 +62,14 @@ class Knowledge:
         with self.lock:
             if self.collection.get(where={"doc_id": doc_id}, limit=1)["ids"]:
                 return doc_id, False
-            vectors = self.encoder.encode([c.text for c in chunks])
             try:
                 for offset in range(0, len(chunks), 128):
                     batch = chunks[offset : offset + 128]
-                    self.collection.add(
+                    self.vectorstore.add_documents(
+                        documents=[
+                            Document(page_content=c.text, metadata=c.metadata()) for c in batch
+                        ],
                         ids=[c.id for c in batch],
-                        documents=[c.text for c in batch],
-                        metadatas=[c.metadata() for c in batch],
-                        embeddings=vectors[offset : offset + 128],
                     )
             except Exception:
                 self.collection.delete(where={"doc_id": doc_id})
@@ -83,18 +99,20 @@ class Knowledge:
     def search(self, question: str, doc_ids: list[str], k: int = 6) -> list[Chunk]:
         if not doc_ids or not self.collection.count():
             return []
-        data = self.collection.query(
-            query_embeddings=self.encoder.encode([question], query=True),
-            where=self.scope(doc_ids),
-            n_results=min(k, self.collection.count()),
-            include=["documents", "metadatas", "distances"],
+        retriever = self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": min(k, self.collection.count()), "filter": self.scope(doc_ids)},
         )
         # Similarity ranks candidates; the generator separately judges direct support.
+        with tracing_context(enabled=False):
+            documents = retriever.invoke(question)
         return [
-            Chunk(id=ident, text=text, **meta)
-            for ident, text, meta in zip(
-                data["ids"][0], data["documents"][0], data["metadatas"][0], strict=True
+            Chunk(
+                id=doc.id or f"{doc.metadata['doc_id']}:{doc.metadata['index']}",
+                text=doc.page_content,
+                **doc.metadata,
             )
+            for doc in documents
         ]
 
     def delete(self, doc_id: str):
