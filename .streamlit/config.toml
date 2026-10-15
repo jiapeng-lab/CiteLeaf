@@ -1,0 +1,13 @@
+[server]
+fileWatcherType = "none"
+maxUploadSize = 15
+
+[theme]
+primaryColor = "#285e49"
+backgroundColor = "#f7f8f3"
+secondaryBackgroundColor = "#edf1e8"
+textColor = "#253b32"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
