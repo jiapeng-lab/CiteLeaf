@@ -2,7 +2,7 @@
 
 **把资料，变成有据可查的答案。**
 
-[GitHub 仓库](https://github.com/jiapeng-lab/-CiteLeaf) · [验证记录](docs/VALIDATION.md) · [真实模型验收](docs/evaluation.json)
+[GitHub 仓库](https://github.com/jiapeng-lab/CiteLeaf) · [验证记录](docs/VALIDATION.md) · [真实模型验收](docs/evaluation.json)
 
 一个面向中文 PDF / TXT 的文档问答 Agent：上传资料，在所选文档内提问、继续追问，或生成全文及指定主题摘要。每条结论携带引用和经过逐字校验的原文摘录，文档没有依据时明确说明。
 
