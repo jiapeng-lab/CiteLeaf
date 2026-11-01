@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @dataclass(frozen=True)
 class Settings:
+    """集中保存模型、凭据和本地数据目录配置。"""
     api_key: str = field(default="", repr=False)
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-flash"
@@ -20,6 +21,8 @@ class Settings:
 
     @classmethod
     def load(cls):
+        """加载项目 .env 和环境变量，生成应用配置。"""
+        # 统一从环境变量读取配置；密钥字段不出现在 Settings 的 repr 中。
         load_dotenv(ROOT / ".env")
         return cls(
             api_key=os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY", ""),

@@ -41,11 +41,14 @@ footer{visibility:hidden}
 
 @st.cache_resource(show_spinner="正在准备本地向量模型，首次运行可能需要下载…")
 def resources(data_dir, model_id, model_path):
+    """创建并缓存向量模型和本地知识库。"""
+    # Streamlit 每次交互都会重新运行脚本，缓存资源避免反复加载向量模型。
     encoder = BGEEncoder(model_path or model_id)
     return Knowledge(Path(data_dir) / "chroma", encoder, model_id)
 
 
 def show_result(result: dict):
+    """展示回答、引用原文和本轮执行步骤。"""
     st.markdown(result["answer"])
     if result.get("cached"):
         st.caption("本次使用已校验的会话摘要缓存")
@@ -124,6 +127,7 @@ with st.sidebar:
         format_func=lambda value: names[value],
         key=f"scope_{','.join(ids)}",
     )
+    # 文档范围变化后清空历史和摘要缓存，避免旧范围的信息影响新回答。
     if selected != st.session_state.scope:
         st.session_state.messages = []
         st.session_state.scope = selected
@@ -196,6 +200,7 @@ for message in st.session_state.messages:
 question = st.chat_input("向文档提问，或输入“总结报销流程”…", disabled=not selected)
 question = question or st.session_state.pop("pending", None)
 if question:
+    # 先取得已有历史，再加入当前问题，避免把当前问题重复传入历史。
     history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
     with st.chat_message("user"):
         st.markdown(question)

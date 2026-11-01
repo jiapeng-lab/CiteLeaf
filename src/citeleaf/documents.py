@@ -12,6 +12,7 @@ MAX_BYTES = 15 * 1024 * 1024
 
 @dataclass(frozen=True)
 class Chunk:
+    """保存一个文本片段及其文档、页码和顺序等来源信息。"""
     id: str
     doc_id: str
     filename: str
@@ -20,13 +21,16 @@ class Chunk:
     text: str
 
     def metadata(self):
+        """提取需要随向量一起保存的来源信息。"""
         return {k: v for k, v in asdict(self).items() if k not in {"id", "text"}}
 
 
 def split_text(text: str, size: int = 420, overlap: int = 60) -> list[str]:
+    """将文本按段落和标点拆成适合检索的、允许重叠的片段。"""
     if not 0 <= overlap < size:
         raise ValueError("分块参数需要满足 0 ≤ overlap < size")
     text = text.replace("\x00", "").replace("\r\n", "\n").strip()
+    # 优先沿段落和标点切分，尽量保留语义；重叠帮助检索跨片段的信息。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=size,
         chunk_overlap=overlap,
@@ -37,6 +41,7 @@ def split_text(text: str, size: int = 420, overlap: int = 60) -> list[str]:
 
 
 def parse_file(content: bytes, filename: str) -> list[Chunk]:
+    """校验并解析 PDF 或 TXT，生成保留来源位置的文本片段。"""
     if not content or len(content) > MAX_BYTES:
         raise ValueError("文件为空或超过 15 MB 上限")
     filename = Path(filename).name
@@ -62,8 +67,10 @@ def parse_file(content: bytes, filename: str) -> list[Chunk]:
             raise ValueError("PDF 解析失败，请确认文件没有损坏") from exc
     else:
         raise ValueError("仅支持 PDF 或 TXT 文件")
+    # 用文件内容生成稳定 ID：相同内容即使改名也不会重复入库。
     doc_id = hashlib.sha256(content).hexdigest()
     chunks = []
+    # 按页分块，给每个片段保留页码与顺序，供引用展示和全文读取使用。
     for page, text in pages:
         for piece in split_text(text):
             index = len(chunks)

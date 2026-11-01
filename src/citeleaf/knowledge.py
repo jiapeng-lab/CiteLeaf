@@ -13,9 +13,11 @@ from .documents import Chunk, parse_file
 
 
 class BGEEncoder(Embeddings):
+    """封装本地 BGE 模型，分别提供文档和查询的向量化接口。"""
     def __init__(self, model: str):
         from langchain_huggingface import HuggingFaceEmbeddings
 
+        # 文档和查询使用相同的归一化向量；BGE 查询额外添加检索提示前缀。
         self.model = HuggingFaceEmbeddings(
             model_name=model,
             model_kwargs={"device": "cpu"},
@@ -27,13 +29,16 @@ class BGEEncoder(Embeddings):
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """将多个文档片段转换为向量，用于建立索引。"""
         return self.model.embed_documents(texts)
 
     def embed_query(self, text: str) -> list[float]:
+        """将用户问题转换为查询向量，用于相似度检索。"""
         return self.model.embed_query(text)
 
 
 class Knowledge:
+    """管理本地向量知识库，提供文档入库、查询、读取和删除能力。"""
     def __init__(self, directory: Path, encoder, model_id: str = "BAAI/bge-small-zh-v1.5"):
         import chromadb
 
@@ -41,6 +46,7 @@ class Knowledge:
         self.client = chromadb.PersistentClient(path=str(directory))
         # Keep the persisted v1 schema/model namespace: existing vectors and sources
         # remain valid. The LangChain splitter uses the same 420/60 size limits.
+        # 模型或索引版本变化时使用不同集合，避免不同向量空间混用。
         fingerprint = hashlib.sha256((model_id + ":420:60:v1").encode()).hexdigest()[:12]
         self.vectorstore = Chroma(
             client=self.client,
@@ -54,11 +60,14 @@ class Knowledge:
 
     @staticmethod
     def scope(doc_ids: list[str]):
+        """构造只匹配所选文档的 Chroma 过滤条件。"""
         return {"doc_id": {"$in": doc_ids}}
 
     def ingest(self, content: bytes, filename: str) -> tuple[str, bool]:
+        """解析并索引文档；返回文档 ID 和是否实际新增。"""
         chunks = parse_file(content, filename)
         doc_id = chunks[0].doc_id
+        # 去重和写入放在同一把锁内；批量写入失败时删除该文档的已写入片段。
         with self.lock:
             if self.collection.get(where={"doc_id": doc_id}, limit=1)["ids"]:
                 return doc_id, False
@@ -77,6 +86,7 @@ class Knowledge:
         return doc_id, True
 
     def documents(self) -> list[dict]:
+        """列出已入库文档及各自的片段数量。"""
         data = self.collection.get(include=["metadatas"])
         counts = {}
         for meta in data["metadatas"]:
@@ -85,6 +95,7 @@ class Knowledge:
         return sorted(counts.values(), key=lambda x: x["filename"])
 
     def read(self, doc_ids: list[str]) -> list[Chunk]:
+        """按文档及原文顺序读取所选文档的全部片段，供摘要使用。"""
         if not doc_ids:
             return []
         data = self.collection.get(where=self.scope(doc_ids), include=["documents", "metadatas"])
@@ -94,11 +105,14 @@ class Knowledge:
                 data["ids"], data["documents"], data["metadatas"], strict=True
             )
         ]
+        # Chroma 返回顺序不保证是原文顺序，摘要前按文档和片段序号排序。
         return sorted(rows, key=lambda c: (c.filename, c.doc_id, c.index))
 
     def search(self, question: str, doc_ids: list[str], k: int = 6) -> list[Chunk]:
+        """在所选文档中检索与问题语义相近的片段。"""
         if not doc_ids or not self.collection.count():
             return []
+        # 过滤条件限制检索范围；相似度只负责排序，不代表答案一定有依据。
         retriever = self.vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": min(k, self.collection.count()), "filter": self.scope(doc_ids)},
@@ -116,5 +130,6 @@ class Knowledge:
         ]
 
     def delete(self, doc_id: str):
+        """删除指定文档的所有索引片段。"""
         with self.lock:
             self.collection.delete(where={"doc_id": doc_id})
