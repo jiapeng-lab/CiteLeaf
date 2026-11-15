@@ -87,7 +87,10 @@ class DocumentAgent:
             chunks = self.knowledge.search(query, doc_ids)
             # 引用编号仅在本次回答内有效，后续用它连接结论和原文片段。
             sources = [Source(f"S{i}", c) for i, c in enumerate(chunks, 1)]
-            steps.append(f"范围内检索：{len(sources)} 个候选片段")
+            retrieval_mode = (
+                "混合检索" if self.knowledge.hybrid_search else "向量检索"
+            ) + " + 重排"
+            steps.append(f"范围内检索（{retrieval_mode}）：{len(sources)} 个候选片段")
             if not sources:
                 return Result("所选文档没有可读取的内容。", steps=steps, status="empty")
             claims = generate(self.model, query, sources, history)

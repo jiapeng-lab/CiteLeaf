@@ -32,6 +32,16 @@ class TinyEncoder(Embeddings):
         return self.encode([text], query=True)[0]
 
 
+class NoopReranker:
+    """离线测试替身：透传候选顺序，不触发真实重排模型下载。"""
+
+    def __init__(self, model_name=""):
+        pass
+
+    def rerank(self, query, chunks, top_k):
+        return chunks[:top_k]
+
+
 class ScriptedModel:
     def __init__(self, responses):
         self.responses, self.payloads = iter(responses), []
@@ -54,7 +64,9 @@ def supported(payload):
 
 @pytest.fixture
 def kb(tmp_path):
-    return Knowledge(tmp_path / "index", TinyEncoder(), "test-double")
+    store = Knowledge(tmp_path / "index", TinyEncoder(), "test-double")
+    store.reranker = NoopReranker()
+    return store
 
 
 def test_chunks_preserve_entire_text_and_overlap():
@@ -223,6 +235,7 @@ def test_streamlit_import_chat_and_scope_reset(tmp_path, monkeypatch):
     from citeleaf.config import ROOT
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "ui"))
+    monkeypatch.setattr("citeleaf.knowledge.Reranker", NoopReranker)  # 离线测试不触发重排模型下载
     monkeypatch.setattr("citeleaf.knowledge.BGEEncoder", lambda path: TinyEncoder())
     app = AppTest.from_file(str(ROOT / "app.py")).run(timeout=15)
     assert not app.exception
@@ -322,6 +335,7 @@ def test_existing_raw_chroma_index_is_readable_after_migration(tmp_path):
         embeddings=TinyEncoder().embed_documents([chunk.text]),
     )
     kb = Knowledge(directory, TinyEncoder(), "test-double")
+    kb.reranker = NoopReranker()
     assert isinstance(kb.vectorstore, Chroma)
     assert kb.search("年假申请", [chunk.doc_id]) == [chunk]
     assert not kb.ingest("员工年假需要提前五个工作日申请。".encode(), "legacy.txt")[1]

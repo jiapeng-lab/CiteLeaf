@@ -28,6 +28,8 @@ h1,h2,h3{letter-spacing:-.035em;color:#234d3c}
 .stats{display:flex;gap:28px;margin:12px 0 24px}
 .stats>div{flex:1;color:#718073;font-size:12px}
 .stats strong{display:block;font-size:25px;font-weight:500;color:#285e49;margin-top:8px}
+.sample-kicker{font-size:11px;letter-spacing:1.5px;color:#738373;font-weight:700;margin:4px 0 8px}
+.sample-expect{font-size:12px;color:#8a9488;line-height:1.7;margin-top:8px}
 @media(max-width:640px){.hero{font-size:29px}.stats{gap:10px}.block-container{padding-top:2rem}}
 [data-testid="stChatMessage"]{border:1px solid #e0e6da;background:#ffffffb8;border-radius:12px}
 .stButton>button{border-radius:8px}
@@ -40,11 +42,18 @@ footer{visibility:hidden}
 
 
 @st.cache_resource(show_spinner="正在准备本地向量模型，首次运行可能需要下载…")
-def resources(data_dir, model_id, model_path):
+def resources(data_dir, model_id, model_path, hybrid_search, rerank_model,
+              rerank_top_n, top_k):
     """创建并缓存向量模型和本地知识库。"""
     # Streamlit 每次交互都会重新运行脚本，缓存资源避免反复加载向量模型。
     encoder = BGEEncoder(model_path or model_id)
-    return Knowledge(Path(data_dir) / "chroma", encoder, model_id)
+    return Knowledge(
+        Path(data_dir) / "chroma", encoder, model_id,
+        hybrid_search=hybrid_search,
+        rerank_model=rerank_model,
+        rerank_top_n=rerank_top_n,
+        top_k=top_k,
+    )
 
 
 def show_result(result: dict):
@@ -79,7 +88,11 @@ def show_result(result: dict):
 
 settings = Settings.load()
 try:
-    kb = resources(str(settings.data_dir), settings.embedding_model, settings.embedding_path)
+    kb = resources(
+        str(settings.data_dir), settings.embedding_model, settings.embedding_path,
+        settings.hybrid_search, settings.rerank_model,
+        settings.rerank_top_n, settings.top_k,
+    )
 except Exception:
     st.error("本地向量模型初始化失败。请检查网络，或在 .env 设置 EMBEDDING_MODEL_PATH。")
     st.stop()
@@ -149,6 +162,8 @@ with st.sidebar:
     with st.expander("运行配置"):
         st.caption("生成模型：" + settings.model)
         st.caption("向量模型：" + settings.embedding_model)
+        st.caption("混合检索：" + ("开" if settings.hybrid_search else "关"))
+        st.caption("重排：始终开启")
         st.caption("API 凭据：" + ("已配置" if settings.api_key else "未配置"))
         st.caption("文档向量保存在本地；生成时，相关原文会发送给配置的模型服务。")
 
@@ -183,12 +198,17 @@ if not st.session_state.messages:
             unsafe_allow_html=True,
         )
     st.write("")
-    st.caption("第一次使用？在左侧导入演示资料，再试试：")
-    for column, sample in zip(
-        st.columns(3), ["年假有多少天？", "总结全部文档", "公司有育儿假吗？"], strict=True
-    ):
+    st.caption("第一次使用？在左侧导入演示资料，然后按三种情况试试：")
+    samples = [
+        ("① 文档里有答案", "年假有多少天？", "应回答 12 个工作日，并附原文引用"),
+        ("② 需要看完整篇", "总结全部文档", "应覆盖全部章节，保留数字与限制"),
+        ("③ 文档里没有依据", "公司有育儿假吗？", "应明确说无法确认，不猜测"),
+    ]
+    for column, (kicker, sample, expect) in zip(st.columns(3), samples, strict=True):
+        column.markdown(f'<div class="sample-kicker">{kicker}</div>', unsafe_allow_html=True)
         if column.button(sample, use_container_width=True, disabled=not selected):
             st.session_state.pending = sample
+        column.markdown(f'<div class="sample-expect">{expect}</div>', unsafe_allow_html=True)
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):

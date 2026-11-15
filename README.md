@@ -6,7 +6,7 @@
 
 一个面向中文 PDF / TXT 的文档问答 Agent：上传资料，在所选文档内提问、继续追问，或生成全文及指定主题摘要。每条结论携带引用和经过逐字校验的原文摘录，文档没有依据时明确说明。
 
-**技术栈：Python + LangChain + RAG**，搭配 Chroma 向量库、BGE 中文 Embedding、DeepSeek 和 Streamlit。
+**技术栈：Python + LangChain + RAG**，搭配 Chroma 向量库、BGE 中文 Embedding 与重排、jieba 关键词检索、DeepSeek 和 Streamlit。
 
 <img src="docs/demo.png" alt="知页 CiteLeaf 文档问答：回答、引用编号与对应原文同屏展示" width="1100" />
 
@@ -16,7 +16,7 @@
 
 需要 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。首次安装依赖和向量模型需要网络与足够磁盘空间，无需 GPU。
 
-锁文件使用清华 PyPI 公共镜像。若镜像在你的网络不可达，可运行 `uv sync --default-index https://pypi.org/simple --group dev` 改用 PyPI；该操作会更新锁文件的来源配置。
+锁文件使用 PyPI 官方源。若需要更快的国内下载速度，可运行 `uv sync --default-index https://pypi.tuna.tsinghua.edu.cn/simple --group dev` 改用清华镜像；该操作会更新锁文件的来源配置。
 
 Linux / Windows 的 PyTorch 使用官方 CPU 源，避免为本地演示和 CI 下载 CUDA 依赖；macOS 使用标准 wheel。推荐通过 uv 安装以应用这些来源规则。
 
@@ -34,11 +34,18 @@ LLM_API_KEY=your_key_here
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-flash
 EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+# 检索路线：开 = BGE + BM25 混合检索，关 = 单独 BGE（两条路线都会重排）。
+HYBRID_SEARCH=false
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANK_TOP_N=20
+TOP_K=6
 ```
 
 默认模型名以本次实际接口可用性为准，也可替换成服务商当前支持 JSON 输出的模型。其他兼容接口需同时修改 URL、模型和密钥，并重新运行验收；不承诺所有兼容服务行为完全相同。
 
 向量模型默认从 Hugging Face 下载。网络受限时，先从 [BAAI 官方模型页面](https://huggingface.co/BAAI/bge-small-zh-v1.5) 合法下载完整模型，在 `.env` 中设置 `EMBEDDING_MODEL_PATH=/本地模型目录`。本地模型必须与 `EMBEDDING_MODEL` 指向同一模型；更换模型时同步更新模型标识，避免混用向量。模型权重不随仓库提交。
+
+重排模型默认 `BAAI/bge-reranker-v2-m3`（CPU 运行），首次提问时从 Hugging Face 下载；可把 `RERANK_MODEL` 换成更轻的 `BAAI/bge-reranker-base`。jieba 分词词典随依赖包内置，无需额外下载。
 
 不使用 uv 时，也可创建 Python 3.12 虚拟环境，运行 `python -m pip install -e .`；该方式不使用 `uv.lock` 的精确解析结果。
 
@@ -62,17 +69,18 @@ EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 flowchart TD
     U[问题 + 所选文档 + 最近对话] --> P[有界任务规划]
     P -->|问答| H[必要时改写追问]
-    H --> R[LangChain Chroma Retriever 范围内检索]
+    H --> R[范围内召回：BGE 向量 + 可选 BM25 关键词]
+    R --> RF[RRF 融合 → cross-encoder 重排]
     P -->|摘要| F[按顺序读取全部片段]
     F --> M[分批摘要与层次合并]
-    R --> G[LCEL 提示词与模型生成链]
+    RF --> G[LCEL 提示词与模型生成链]
     M --> V[结论引用与原文摘录校验]
     G --> V
     V --> A[回答 + 来源 + 执行步骤]
 ```
 
 - **规划**：显式模式优先，自动模式用有限规则识别摘要请求，决定调用检索工具或全文读取工具。它是有界任务型 Agent，不宣称具备开放式自主规划或 Function Calling。
-- **工具**：`Knowledge.search` 调用 LangChain Chroma Retriever 检索选中文档；`Knowledge.read` 顺序读取选中文档；解析、入库和删除是界面可调用的数据能力。
+- **工具**：`Knowledge.search` 在选中文档内做范围内召回（BGE 向量 + 可选 BM25 关键词），融合后重排；`Knowledge.read` 顺序读取选中文档；解析、入库和删除是界面可调用的数据能力。
 - **记忆**：保留最近 6 条消息，每条最多 800 字符，仅用于追问理解；历史不作为事实证据。当前问题独立保留，最多 3000 字。
 - **回答**：模型返回 `supported` 和逐条 `claims`，每条结论必须携带证据编号与至少 6 个字符的连续原文摘录。
 - **校验**：编号必须存在，摘录移除空白后必须是对应原文的子串；任一结论失败则停止展示生成答案。
@@ -88,19 +96,21 @@ flowchart TD
 | 框架 | LangChain 模块化集成包 | 使用统一 Document、Embeddings、Retriever 和 Runnable 接口 |
 | 向量模型 | HuggingFaceEmbeddings + BGE small 中文 | CPU 可运行，Embedding 在本地完成 |
 | 向量库 | langchain-chroma + Chroma 持久化 | 保存文本、向量与来源元数据，Retriever 按文档范围过滤 |
+| 关键词检索 | 自研 BM25 倒排索引 + jieba 分词 | 补向量易漏的精确词/编号，随库持久化、按文档范围过滤 |
+| 重排 | sentence-transformers CrossEncoder（bge-reranker-v2-m3，CPU） | 对召回的 top-20 精排取 top-k，提高进入生成的片段精度 |
 | 文档处理 | pypdf + UTF-8 TXT | 覆盖题目格式，PDF 按页保留来源 |
 | 分块 | RecursiveCharacterTextSplitter | 420 字符上限，目标重叠 60；优先段落和中文标点 |
 | 模型调用 | ChatDeepSeek；兼容端点用 ChatOpenAI | 统一模型接口，保留超时、有限重试与错误脱敏 |
 | 生成链 | ChatPromptTemplate → 模型 → 严格 JSON 检查 → JsonOutputParser | 用 LCEL 组合提示词、模型和解析器，再校验引用 |
 | 任务控制 | Python 有界控制器 + LangChain RAG 组件 | 显式管理问答、记忆、全文摘要和证据边界 |
 
-RAG（检索增强生成）的问答路径是：上传文档 → LangChain 递归分块 → 本地 Embedding → Chroma 入库 → Retriever 检索 → 将原文证据放进提示词 → 模型生成 → 引用校验。全文摘要使用顺序读取和分批合并，保留与检索问答不同的数据获取方式。
+RAG（检索增强生成）的问答路径是：上传文档 → LangChain 递归分块 → 本地 Embedding 与 BM25 入库 → 范围内召回（BGE 向量，可选叠加 BM25 关键词）→ RRF 融合 → cross-encoder 重排 → 将原文证据放进提示词 → 模型生成 → 引用校验。全文摘要使用顺序读取和分批合并，保留与检索问答不同的数据获取方式。
 
 LangChain 通过官方模块化包安装：`langchain-core`、`langchain-text-splitters`、`langchain-huggingface`、`langchain-chroma`、`langchain-deepseek` 和 `langchain-openai`。这些组件参与实际执行，没有额外引入未使用的 Agent 框架。参考 [Chroma 集成](https://docs.langchain.com/oss/python/integrations/vectorstores/chroma)、[DeepSeek 集成](https://docs.langchain.com/oss/python/integrations/chat/deepseek) 和 [递归分块器](https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter) 官方文档。
 
 升级保留原有向量模型、归一化方式、查询前缀、集合名及来源元数据，旧索引仍能读取；新上传文件使用 LangChain 分块器。离线回归专门验证原生 Chroma 索引经 LangChain 读取后的兼容性。
 
-问答不把余弦分数当作“答案正确概率”，由模型判断是否有直接证据。当前 top-6 可能漏掉相关片段，后续可增加混合检索和重排。全文摘要以完整覆盖输入为目标，仍可能在压缩时遗漏信息。
+问答不把余弦分数当作“答案正确概率”，由模型判断是否有直接证据。检索有两条路线，由 `HYBRID_SEARCH` 控制：单独 BGE 向量，或 BGE + BM25 混合（RRF 融合）；两条都会用 cross-encoder 重排后再取 top-6。全文摘要以完整覆盖输入为目标，仍可能在压缩时遗漏信息。
 
 ## 错误处理与成本
 
@@ -112,6 +122,7 @@ LangChain 通过官方模块化包安装：`langchain-core`、`langchain-text-sp
 - 无历史的普通问题通常一次生成调用；追问增加一次改写；摘要按批处理并保留最多 8 项会话缓存。
 - DeepSeek 官方端点显式关闭默认思考模式，避免简单文档任务的推理消耗挤占 JSON 输出预算；其他服务不发送该专用参数。
 - 向量模型进程内缓存；摘要缓存键包含任务和完整片段内容，避免文档变化后复用。
+- 重排模型走 CPU、进程内懒加载，首次提问时下载，失败则回退到精排前的候选顺序、不阻断问答；BM25 索引随库持久化，升级后首次开启混合检索会从向量库回填一次。
 - 检索和生成链显式关闭 LangSmith 云端追踪；安装 LangChain 不需要新增追踪服务密钥。
 
 ## 测试与验收
@@ -125,9 +136,9 @@ uv run ruff check .
 uv run python evals/run.py
 ```
 
-离线测试使用明确标注的向量/模型替身，覆盖解析、分块完整性、PDF 页码、持久化、文档隔离、删除、伪造引用拦截、多轮改写、摘要末尾读取及缓存失效。替身结果不作为模型效果证明。
+离线测试使用明确标注的向量/模型/重排替身，覆盖解析、分块完整性、PDF 页码、持久化、文档隔离、删除、伪造引用拦截、多轮改写、摘要末尾读取、缓存失效，以及 BM25 范围过滤、RRF 融合、重排排序与失败回退。替身结果不作为模型效果证明。
 
-真实验收脚本使用临时索引，不改动用户知识库，覆盖事实、拒答、追问、跨文档、摘要、长文末尾、缓存与文档指令注入。报告保存在 [`docs/evaluation.json`](docs/evaluation.json)。自动检查使用状态、数字关键词与引用结构，**通过率不等于通用准确率或项目评分**。应查看每条答案及摘录，人工判断语义支持。
+真实验收脚本使用临时索引，不改动用户知识库，覆盖事实、拒答、追问、跨文档、摘要、长文末尾、缓存与文档指令注入。报告保存在 [`docs/evaluation.json`](docs/evaluation.json)。自动检查使用状态、数字关键词与引用结构，**通过率不等于通用准确率或项目评分**；检索召回率需另用带标注的问题集按 Recall@k、MRR、nDCG 评估。应查看每条答案及摘录，人工判断语义支持。
 
 GitHub Actions 运行离线测试和静态检查，不需要密钥，也不调用计费 API。
 
@@ -140,10 +151,12 @@ app.py                    # 上传、聊天、引用与导出
 src/citeleaf/
   config.py               # 配置和凭据边界
   documents.py            # 解析与 LangChain 递归分块
-  knowledge.py            # HuggingFaceEmbeddings、Chroma Retriever、范围读取
+  knowledge.py            # 向量/关键词入库、混合检索编排、范围读取
+  retrieval.py            # BM25 倒排索引、RRF 融合、cross-encoder 重排
   generation.py           # LCEL 生成链、逐条结论与摘录校验
   agent.py                # 规划、记忆和摘要缓存
 tests/test_core.py        # 离线回归
+tests/test_retrieval.py   # 检索链路离线回归（BM25/RRF/重排）
 evals/run.py              # 真实模型验收
 examples/                 # 可公开的虚构文档
 docs/                     # 验收证据与演示
@@ -152,7 +165,7 @@ pyproject.toml / uv.lock  # 依赖与锁文件
 
 ## 数据与部署边界
 
-这是单用户本地演示应用。文档文本和向量保存在 `data/`，清空浏览器不会删除本地知识库。相关片段、摘要原文及有限历史在生成时发送给配置的模型服务；请仅导入有权处理的材料。
+这是单用户本地演示应用。文档文本、向量和 BM25 索引保存在 `data/`，清空浏览器不会删除本地知识库。相关片段、摘要原文及有限历史在生成时发送给配置的模型服务；请仅导入有权处理的材料。
 
 默认绑定 `127.0.0.1`。没有实现鉴权、租户隔离、OCR、复杂表格重建或跨会话访问控制，不能直接作为公开多人知识库服务部署。公开 GitHub 仓库不等于把本地应用公开到互联网。
 

@@ -29,6 +29,10 @@ def main():
             Path(directory),
             BGEEncoder(settings.embedding_path or settings.embedding_model),
             settings.embedding_model,
+            hybrid_search=settings.hybrid_search,
+            rerank_model=settings.rerank_model,
+            rerank_top_n=settings.rerank_top_n,
+            top_k=settings.top_k,
         )
         ids = {}
         for path in sorted((ROOT / "examples").glob("*.txt")):
